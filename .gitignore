@@ -1,0 +1,77 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Installer logs
+pip-log.txt
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+htmlcov/
+
+# Translations
+*.mo
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Mypy
+.mypy_cache/
+
+# Pyre
+.pyre/
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# VS Code
+.vscode/
+
+# IDEs
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# dotenv
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Databases
+*.sqlite3
+
+# OS files
+.DS_Store
+
+# Python bytecode
+*.pyc
+
+# Misc
+celerybeat-schedule
+Pipfile.lock
+.python-version
+.ropeproject/
