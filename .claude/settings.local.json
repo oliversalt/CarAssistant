@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source venv/Scripts/activate)",
+      "Bash(python -c \"import openai; print\\(openai.__version__\\)\")",
+      "WebSearch",
+      "WebFetch(domain:platform.openai.com)",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:openai.com)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:cookbook.openai.com)"
+    ]
+  }
+}
