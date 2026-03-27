@@ -75,3 +75,5 @@ celerybeat-schedule
 Pipfile.lock
 .python-version
 .ropeproject/
+
+*.wav
