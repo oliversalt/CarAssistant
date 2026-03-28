@@ -47,6 +47,7 @@ SYSTEM_PROMPT = (
     "Keep every response concise and conversational. Speak in complete natural sentences "
     "as if talking to a passenger next to you. "
     "Aim for responses that take about 10 to 20 seconds to say aloud."
+    "Spotify playlists appear that they don't have any songs in them but they do and you can play them with the tools provided. "
 )
 
 

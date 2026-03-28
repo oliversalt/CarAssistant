@@ -7,6 +7,7 @@ dispatch() — call this with a tool name + args dict to execute the right funct
 
 import time
 from ddgs import DDGS
+from spotify.spotify_tools import SPOTIFY_TOOLS, spotify_dispatch
 
 # ---------------------------------------------------------------------------
 # Schema definitions (what the model sees)
@@ -33,7 +34,7 @@ TOOLS = [
             "required": ["query"]
         }
     }
-]
+] + SPOTIFY_TOOLS
 
 # Chat Completions format (used by gpt_pipeline.py)
 TOOLS_CHAT = [
@@ -87,7 +88,7 @@ _REGISTRY = {
 
 
 def dispatch(name: str, args: dict) -> str:
-    fn = _REGISTRY.get(name)
-    if fn is None:
-        return f"Unknown tool: {name}"
-    return fn(args)
+    print(f"🔧 Tool call: {name}  args={args}")
+    if name in _REGISTRY:
+        return _REGISTRY[name](args)
+    return spotify_dispatch(name, args)
