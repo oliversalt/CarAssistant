@@ -17,7 +17,6 @@ import json
 import os
 import queue
 import threading
-import time
 
 import msvcrt
 
@@ -166,7 +165,6 @@ async def receive_response(
     play_queue: queue.Queue,
     stop_playback: threading.Event,
     enters: EnterQueue,
-    t_committed: float,
 ) -> tuple[str, str, bool, bool]:
     """
     Reads WebSocket events until response.done (or interrupt).
@@ -177,7 +175,6 @@ async def receive_response(
     """
     user_text = ""
     assistant_text = ""
-    t_first_audio = None
     pending_fn_calls: dict[str, dict] = {}
 
     # Discard any Enter presses that arrived before we started listening
@@ -215,9 +212,6 @@ async def receive_response(
         etype = event.get("type", "")
 
         if etype == "response.audio.delta":
-            if t_first_audio is None:
-                t_first_audio = time.perf_counter()
-                print(f"⏱  Commit → first audio:    {t_first_audio - t_committed:.2f}s")
             play_queue.put(base64.b64decode(event["delta"]))
 
         elif etype == "response.audio_transcript.delta":
@@ -225,7 +219,7 @@ async def receive_response(
 
         elif etype == "conversation.item.input_audio_transcription.completed":
             user_text = event.get("transcript", "").strip()
-            print(f"💬 You said: {user_text}")
+            print(f"\n💬 You said: {user_text}\n")
 
         elif etype == "response.output_item.added":
             item = event.get("item", {})
@@ -238,9 +232,6 @@ async def receive_response(
                 pending_fn_calls[call_id]["arguments"] += event.get("delta", "")
 
         elif etype == "response.done":
-            t_done = time.perf_counter()
-            print(f"⏱  Commit → response done:  {t_done - t_committed:.2f}s")
-
             if pending_fn_calls:
                 for call_id, fn in pending_fn_calls.items():
                     args = json.loads(fn["arguments"])
@@ -255,7 +246,6 @@ async def receive_response(
                     }))
                 pending_fn_calls.clear()
                 await ws.send(json.dumps({"type": "response.create"}))
-                t_committed = time.perf_counter()
             else:
                 break
 
@@ -340,7 +330,6 @@ async def main():
 
             # --- Record ---
             print("🎤 Recording... press Enter to stop")
-            t_record_start = time.perf_counter()
             stop_recording = asyncio.Event()
             mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
 
@@ -348,12 +337,10 @@ async def main():
             print("⏹  Recording stopped")
             stop_recording.set()
             await mic_task
-            print(f"⏱  Recording duration:      {time.perf_counter() - t_record_start:.2f}s")
 
             # --- Commit and request response ---
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
-            t_committed = time.perf_counter()
 
             # --- Start player ---
             play_queue: queue.Queue = queue.Queue()
@@ -366,7 +353,7 @@ async def main():
             # --- Receive response (interrupt detection is inside via poll()) ---
             print("🤖 Thinking...  (press Enter to interrupt, # to dismiss)")
             user_text, assistant_text, interrupted, dismissed = await receive_response(
-                ws, play_queue, stop_playback, enters, t_committed
+                ws, play_queue, stop_playback, enters
             )
 
             # --- Wait for playback, checking for interrupt/dismiss every 50ms ---
@@ -389,11 +376,8 @@ async def main():
 
             player.join()
 
-            if not interrupted and not dismissed:
-                print(f"⏱  Commit → playback end:   {time.perf_counter() - t_committed:.2f}s")
-
             if assistant_text:
-                print(f"✅ Assistant: {assistant_text}\n")
+                print(f"\n✅ Assistant: {assistant_text}\n")
 
             if user_text:
                 conversation_log.append({"role": "user", "text": user_text})
