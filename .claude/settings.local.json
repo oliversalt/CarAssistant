@@ -8,7 +8,12 @@
       "WebFetch(domain:developers.openai.com)",
       "WebFetch(domain:openai.com)",
       "WebFetch(domain:pypi.org)",
-      "WebFetch(domain:cookbook.openai.com)"
+      "WebFetch(domain:cookbook.openai.com)",
+      "WebFetch(domain:ai.google.dev)",
+      "WebFetch(domain:docs.cloud.google.com)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:discuss.ai.google.dev)"
     ]
   }
 }
