@@ -3,6 +3,7 @@ Realtime Pipeline — gpt-realtime-1.5
 -------------------------------------
 Uses the OpenAI Realtime API over a persistent WebSocket.
 Push-to-talk: press Enter to start speaking, press Enter again to stop.
+Press Enter while the model is speaking to interrupt it and start talking.
 The WebSocket stays open between turns — no reconnection delay.
 Prints a full conversation transcript when you quit.
 
@@ -22,6 +23,8 @@ import pyaudio
 import websockets
 from dotenv import load_dotenv
 
+from tools import TOOLS, dispatch
+
 load_dotenv()
 
 MIC_INDEX = 1
@@ -33,6 +36,12 @@ CHUNK = 1024
 MODEL = "gpt-realtime-1.5"
 VOICE = "alloy"     # options: alloy, echo, fable, onyx, nova, shimmer
 WS_URL = f"wss://api.openai.com/v1/realtime?model={MODEL}"
+
+def get_input(prompt=""):
+    result = input(prompt)
+    print("⌨️  Enter pressed")
+    return result
+
 
 SYSTEM_PROMPT = (
     "You are a knowledgeable and curious companion riding along in the car. "
@@ -50,11 +59,11 @@ SYSTEM_PROMPT = (
 # Audio playback — runs in its own thread, plays PCM16 chunks from a queue
 # ---------------------------------------------------------------------------
 
-def audio_player(play_queue: queue.Queue):
+def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
     p = pyaudio.PyAudio()
     stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True)
     try:
-        while True:
+        while not stop_event.is_set():
             chunk = play_queue.get()
             if chunk is None:   # sentinel — stop playing
                 break
@@ -63,6 +72,16 @@ def audio_player(play_queue: queue.Queue):
         stream.stop_stream()
         stream.close()
         p.terminate()
+
+
+def drain_queue(q: queue.Queue):
+    """Empty a queue and send the None sentinel to stop the player thread."""
+    while not q.empty():
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            break
+    q.put(None)
 
 
 # ---------------------------------------------------------------------------
@@ -93,17 +112,40 @@ async def stream_mic(ws, stop_event: asyncio.Event):
 # Response receiver — reads WebSocket events until response.done
 # ---------------------------------------------------------------------------
 
-async def receive_response(ws, play_queue: queue.Queue, t_committed: float) -> tuple[str, str]:
+async def receive_response(
+    ws,
+    play_queue: queue.Queue,
+    t_committed: float,
+    interrupt_event: asyncio.Event,
+) -> tuple[str, str, bool]:
     """
     Consumes WebSocket events for one response turn.
+    Handles tool calls before the final audio response.
     Plays audio via play_queue as chunks arrive.
-    Returns (user_transcript, assistant_transcript).
+
+    Returns (user_transcript, assistant_transcript, was_interrupted).
     """
     user_text = ""
     assistant_text = ""
     t_first_audio = None
+    pending_fn_calls: dict[str, dict] = {}   # call_id → {name, arguments}
 
     async for raw in ws:
+        # Check for interrupt on every event
+        if interrupt_event.is_set():
+            await ws.send(json.dumps({"type": "response.cancel"}))
+            drain_queue(play_queue)
+            # Drain stale WebSocket events until the server confirms the cancel.
+            # Without this, leftover audio.delta events from the cancelled response
+            # sit in the buffer and get picked up as the next response's audio.
+            print("🧹 Draining cancelled response...")
+            async for stale in ws:
+                stale_type = json.loads(stale).get("type", "")
+                if stale_type in ("response.cancelled", "response.done", "error"):
+                    print(f"✅ Cancel confirmed ({stale_type})")
+                    break
+            return user_text, assistant_text, True
+
         event = json.loads(raw)
         etype = event.get("type", "")
 
@@ -120,17 +162,68 @@ async def receive_response(ws, play_queue: queue.Queue, t_committed: float) -> t
             user_text = event.get("transcript", "").strip()
             print(f"💬 You said: {user_text}")
 
+        elif etype == "response.output_item.added":
+            item = event.get("item", {})
+            if item.get("type") == "function_call":
+                pending_fn_calls[item["call_id"]] = {"name": item["name"], "arguments": ""}
+
+        elif etype == "response.function_call_arguments.delta":
+            call_id = event.get("call_id")
+            if call_id in pending_fn_calls:
+                pending_fn_calls[call_id]["arguments"] += event.get("delta", "")
+
         elif etype == "response.done":
             t_done = time.perf_counter()
             print(f"⏱  Commit → response done:  {t_done - t_committed:.2f}s")
-            break
+
+            if pending_fn_calls:
+                for call_id, fn in pending_fn_calls.items():
+                    args = json.loads(fn["arguments"])
+                    result = dispatch(fn["name"], args)
+                    await ws.send(json.dumps({
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": result,
+                        }
+                    }))
+                pending_fn_calls.clear()
+                await ws.send(json.dumps({"type": "response.create"}))
+                t_committed = time.perf_counter()
+            else:
+                break
 
         elif etype == "error":
             print(f"⚠️  API error: {event.get('error', event)}")
             break
 
-    play_queue.put(None)  # tell player thread to stop
-    return user_text, assistant_text
+    play_queue.put(None)
+    return user_text, assistant_text, False
+
+
+# ---------------------------------------------------------------------------
+# Recording phase — shared between normal turns and post-interrupt turns
+# ---------------------------------------------------------------------------
+
+async def do_recording(ws, loop) -> float:
+    """
+    Records mic audio and sends it to the WebSocket.
+    Returns t_record_end (perf_counter at the moment recording stops).
+    """
+    print("🎤 Recording... press Enter to stop")
+    t_record_start = time.perf_counter()
+    stop_recording = asyncio.Event()
+    mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
+
+    await loop.run_in_executor(None, get_input)
+    print("⏹  Recording stopped")
+    stop_recording.set()
+    await mic_task
+
+    t_record_end = time.perf_counter()
+    print(f"⏱  Recording duration:      {t_record_end - t_record_start:.2f}s")
+    return t_record_end
 
 
 # ---------------------------------------------------------------------------
@@ -149,15 +242,16 @@ async def main():
     print(f"   Model: {MODEL}  |  Voice: {VOICE}")
     print("   Press Enter to start speaking.")
     print("   Press Enter again to stop and get a response.")
+    print("   Press Enter while the model is speaking to interrupt it.")
     print("   Type 'quit' then Enter to exit.")
     print("=" * 50)
 
-    conversation_log = []   # {"role": "user"/"assistant", "text": "..."}
+    conversation_log = []
     loop = asyncio.get_event_loop()
 
     async with websockets.connect(WS_URL, additional_headers=headers) as ws:
 
-        # --- Handshake ---
+        # Handshake
         raw = await ws.recv()
         event = json.loads(raw)
         if event.get("type") != "session.created":
@@ -174,7 +268,9 @@ async def main():
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 "input_audio_transcription": {"model": "whisper-1"},
-                "turn_detection": None,     # manual push-to-talk
+                "turn_detection": None,
+                "tools": TOOLS,
+                "tool_choice": "auto",
             }
         }))
 
@@ -182,52 +278,76 @@ async def main():
         if json.loads(raw).get("type") == "session.updated":
             print("✅ Session configured — ready\n")
 
-        # --- Conversation loop ---
+        # Conversation loop
+        interrupted = False
+
         while True:
-            user_input = await loop.run_in_executor(
-                None, input, "> Press Enter to speak (or type 'quit'): "
-            )
-            if user_input.strip().lower() == "quit":
-                break
+            if not interrupted:
+                user_input = await loop.run_in_executor(
+                    None, get_input, "> Press Enter to speak (or type 'quit'): "
+                )
+                if user_input.strip().lower() == "quit":
+                    break
+                print("🟢 Listening...")
 
-            # Recording phase
-            print("🎤 Recording... press Enter to stop")
-            t_record_start = time.perf_counter()
-            stop_recording = asyncio.Event()
-            mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
+            # --- Recording ---
+            if interrupted:
+                # Clear any leftover audio from the cancelled response before recording
+                await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                print("🎤 Go ahead — press Enter when done speaking")
+            await do_recording(ws, loop)
 
-            await loop.run_in_executor(None, input, "")   # blocks until Enter
-            stop_recording.set()
-            await mic_task
-
-            t_record_end = time.perf_counter()
-            print(f"⏱  Recording duration:      {t_record_end - t_record_start:.2f}s")
-
-            # Commit audio and request a response
+            # Commit and request response
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
             t_committed = time.perf_counter()
 
-            # Start audio player thread
+            # Start audio player thread — stoppable via stop_playback event
             play_queue: queue.Queue = queue.Queue()
-            player = threading.Thread(target=audio_player, args=(play_queue,), daemon=True)
+            stop_playback = threading.Event()
+            player = threading.Thread(
+                target=audio_player, args=(play_queue, stop_playback), daemon=True
+            )
             player.start()
 
-            # Receive response (plays audio as it arrives)
-            print("🤖 Thinking...")
-            user_text, assistant_text = await receive_response(ws, play_queue, t_committed)
+            interrupt_event = asyncio.Event()
 
-            player.join()   # wait for all audio to finish playing
-            t_playback_end = time.perf_counter()
-            print(f"⏱  Commit → playback end:   {t_playback_end - t_committed:.2f}s")
-            print(f"✅ Assistant: {assistant_text}\n")
+            async def watch_for_interrupt():
+                await loop.run_in_executor(None, get_input)
+                print("⚡ Enter pressed — interrupting...")
+                interrupt_event.set()
+                stop_playback.set()
+                drain_queue(play_queue)
 
-            if user_text:
-                conversation_log.append({"role": "user", "text": user_text})
+            print("🤖 Thinking...  (press Enter to interrupt)")
+            interrupt_task = asyncio.create_task(watch_for_interrupt())
+            response_task = asyncio.create_task(
+                receive_response(ws, play_queue, t_committed, interrupt_event)
+            )
+
+            await response_task
+            # Player may still be playing — wait for it (returns instantly if interrupted)
+            await loop.run_in_executor(None, player.join)
+            interrupt_task.cancel()
+
+            user_text, assistant_text, _ = response_task.result()
+            interrupted = interrupt_event.is_set()
+
+            if not interrupted:
+                t_end = time.perf_counter()
+                print(f"⏱  Commit → playback end:   {t_end - t_committed:.2f}s")
+
             if assistant_text:
-                conversation_log.append({"role": "assistant", "text": assistant_text})
+                print(f"✅ Assistant: {assistant_text}\n")
 
-    # --- Transcript ---
+            # Only save complete (non-interrupted) turns to the transcript
+            if not interrupted:
+                if user_text:
+                    conversation_log.append({"role": "user", "text": user_text})
+                if assistant_text:
+                    conversation_log.append({"role": "assistant", "text": assistant_text})
+
+    # Transcript
     if conversation_log:
         print("\n" + "=" * 50)
         print("📝 Conversation Transcript")

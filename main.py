@@ -10,7 +10,8 @@ from elevenlabs import ElevenLabs
 from dotenv import load_dotenv
 from pydub import AudioSegment
 from pydub.playback import play
-from ddgs import DDGS
+
+from tools import TOOLS_ANTHROPIC as TOOLS, dispatch
 
 load_dotenv()
 
@@ -39,43 +40,6 @@ SYSTEM_PROMPT = (
     "Speak in complete natural sentences as if talking to a passenger. "
     "Aim for responses that take about 10 to 20 seconds to say aloud."
 )
-
-TOOLS = [
-    {
-        "name": "web_search",
-        "description": (
-            "Search the internet for current information, news, facts, or anything you are "
-            "uncertain about or that may have changed since your training. "
-            "Use this whenever the user asks about recent events, current prices, live scores, "
-            "or anything that benefits from up-to-date information."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to look up."
-                }
-            },
-            "required": ["query"]
-        }
-    }
-]
-
-
-def web_search(query: str) -> str:
-    print(f"🔍 Searching: {query}")
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
-        if not results:
-            return "No results found."
-        lines = []
-        for r in results:
-            lines.append(f"{r['title']}: {r['body']}")
-        return "\n\n".join(lines)
-    except Exception as e:
-        return f"Search failed: {e}"
 
 
 def record_audio() -> bool:
@@ -136,7 +100,7 @@ def get_response(conversation_history: list) -> str:
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    result = web_search(block.input["query"])
+                    result = dispatch(block.name, block.input)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,

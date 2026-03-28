@@ -22,11 +22,12 @@ import wave
 
 import pyaudio
 from dotenv import load_dotenv
-from ddgs import DDGS
 from elevenlabs import ElevenLabs
 from openai import OpenAI
 from pydub import AudioSegment
 from pydub.playback import play
+
+from tools import TOOLS_CHAT as TOOLS, dispatch
 
 load_dotenv()
 
@@ -40,12 +41,13 @@ CHANNELS = 1
 RATE = 44100
 CHUNK = 1024
 
-MODEL = "gpt-audio-mini-2025-12-15"
+model_list = ["gpt-audio-mini-2025-12-15", "gpt-audio-1.5", "gpt-audio-2025-08-28", ]
+MODEL = model_list[1] 
 MAX_HISTORY_TURNS = 20
 
 ELEVENLABS_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
 ELEVENLABS_MODEL = "eleven_flash_v2_5"
-GPT_VOICE = "alloy"  # options: alloy, echo, fable, onyx, nova, shimmer
+GPT_VOICE = "echo"  # options: alloy, echo, fable, onyx, nova, shimmer
 
 SYSTEM_PROMPT = (
     "You are a knowledgeable and curious companion riding along in the car. "
@@ -58,43 +60,6 @@ SYSTEM_PROMPT = (
     "Speak in complete natural sentences as if talking to a passenger next to you. "
     "Aim for responses that take about 10 to 20 seconds to say aloud."
 )
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the internet for current information, news, facts, or anything you are "
-                "uncertain about or that may have changed since your training. Use this whenever "
-                "the user asks about recent events, current prices, live scores, or anything "
-                "that benefits from up-to-date information."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query to look up."
-                    }
-                },
-                "required": ["query"]
-            }
-        }
-    }
-]
-
-
-def web_search(query: str) -> str:
-    print(f"🔍 Searching: {query}")
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=5))
-        if not results:
-            return "No results found."
-        return "\n\n".join(f"{r['title']}: {r['body']}" for r in results)
-    except Exception as e:
-        return f"Search failed: {e}"
 
 
 def record_audio(filename="input.wav"):
@@ -166,12 +131,16 @@ def get_response(conversation_history: list, audio_b64: str, voice_mode: str) ->
 
         if choice.finish_reason == "tool_calls":
             tool_calls = choice.message.tool_calls
+            print(f"⏱  GPT (tool call): {t1 - t0:.2f}s")
             # Add assistant message with tool calls to context
             messages.append(choice.message)
 
             for tc in tool_calls:
                 args = json.loads(tc.function.arguments)
-                result = web_search(args["query"])
+                t_search0 = time.perf_counter()
+                result = dispatch(tc.function.name, args)
+                t_search1 = time.perf_counter()
+                print(f"⏱  Web search: {t_search1 - t_search0:.2f}s")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -194,7 +163,8 @@ def get_response(conversation_history: list, audio_b64: str, voice_mode: str) ->
             return reply_text, audio_bytes
 
 
-def speak_elevenlabs(text: str):
+def speak_elevenlabs(text: str) -> float:
+    """Generate and play ElevenLabs audio. Returns TTS generation time (excludes playback)."""
     print("🔊 Generating ElevenLabs audio...")
     t0 = time.perf_counter()
     audio = elevenlabs_client.text_to_speech.convert(
@@ -205,19 +175,19 @@ def speak_elevenlabs(text: str):
     audio_bytes = b"".join(audio)
     segment = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
     t1 = time.perf_counter()
-    print(f"⏱  TTS generation: {t1 - t0:.2f}s")
+    tts_time = t1 - t0
+    print(f"⏱  ElevenLabs TTS: {tts_time:.2f}s")
     print("🔊 Playing...")
     play(segment)
     print("✅ Done speaking")
+    return tts_time
 
 
 def speak_gpt_audio(audio_bytes: bytes):
+    """Decode and play GPT-generated audio. Decoding is instant so no meaningful pre-play time."""
     print("🔊 Playing GPT audio...")
-    t0 = time.perf_counter()
     segment = AudioSegment.from_wav(io.BytesIO(audio_bytes))
     play(segment)
-    t1 = time.perf_counter()
-    print(f"⏱  Playback: {t1 - t0:.2f}s")
     print("✅ Done speaking")
 
 
@@ -248,9 +218,9 @@ def main():
             print("👋 Goodbye!")
             break
 
-        t_start = time.perf_counter()
-
         record_audio()
+        t_after_record = time.perf_counter()
+
         audio_b64 = encode_audio("input.wav")
 
         reply_text, audio_bytes = get_response(conversation_history, audio_b64, args.voice)
@@ -259,8 +229,7 @@ def main():
             print("⚠️ No response received, try again")
             continue
 
-        # Store transcript in history as plain text turns
-        # For audio input we store the transcript GPT saw; for the reply we store the text
+        # Store transcript in history
         conversation_history.append({
             "role": "user",
             "content": [
@@ -274,16 +243,17 @@ def main():
             conversation_history.append({"role": "assistant", "content": reply_text})
         conversation_history = trim_history(conversation_history)
 
-        # Speak the response
-        t_speak = time.perf_counter()
+        # Speak the response — capture time to first audio (before playback starts)
+        t_before_tts = time.perf_counter()
         if args.voice == "gpt" and audio_bytes:
+            # Audio already generated by GPT — playback starts immediately
+            t_to_playback = t_before_tts - t_after_record
+            print(f"⏱  Time to playback: {t_to_playback:.2f}s  (record end → play start)")
             speak_gpt_audio(audio_bytes)
         else:
-            speak_elevenlabs(reply_text)
-        t_end = time.perf_counter()
-
-        print(f"⏱  TTS + playback: {t_end - t_speak:.2f}s")
-        print(f"⏱  Total pipeline: {t_end - t_start:.2f}s")
+            tts_time = speak_elevenlabs(reply_text)
+            t_to_playback = (t_before_tts - t_after_record) + tts_time
+            print(f"⏱  Time to playback: {t_to_playback:.2f}s  (record end → play start)")
 
 
 if __name__ == "__main__":
