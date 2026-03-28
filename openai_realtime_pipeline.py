@@ -16,9 +16,10 @@ import base64
 import json
 import os
 import queue
-import sys
 import threading
 import time
+
+import msvcrt
 
 import pyaudio
 import websockets
@@ -72,17 +73,23 @@ class EnterQueue:
 
     def _reader(self):
         while True:
-            line = sys.stdin.readline().strip()
-            print("⌨️  Enter pressed")
-            self._q.put(line)
+            ch = msvcrt.getwch()
+            if ch in ('\r', '\n'):
+                print("⌨️  Enter pressed")
+                self._q.put("")
+            elif ch == '#':
+                print("⌨️  # pressed")
+                self._q.put("#")
+            elif ch == '\x03':  # Ctrl+C
+                self._q.put("quit")
+            # ignore all other keys
 
-    def poll(self) -> bool:
-        """Non-blocking: returns True and consumes the press if one is queued."""
+    def poll(self) -> "str | None":
+        """Non-blocking: returns the key pressed ('' for Enter, '#' for hash) or None."""
         try:
-            self._q.get_nowait()
-            return True
+            return self._q.get_nowait()
         except queue.Empty:
-            return False
+            return None
 
     def drain(self):
         """Discard all queued Enter presses."""
@@ -160,11 +167,13 @@ async def receive_response(
     stop_playback: threading.Event,
     enters: EnterQueue,
     t_committed: float,
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, bool, bool]:
     """
     Reads WebSocket events until response.done (or interrupt).
     Checks enters.poll() after every event — no separate task, no cancel races.
-    Returns (user_transcript, assistant_transcript, was_interrupted).
+    Returns (user_transcript, assistant_transcript, was_interrupted, was_dismissed).
+    was_interrupted=True  → Enter pressed mid-response, start recording immediately.
+    was_dismissed=True    → # pressed, stop speaking, return to idle prompt.
     """
     user_text = ""
     assistant_text = ""
@@ -177,9 +186,12 @@ async def receive_response(
 
     async for raw in ws:
 
-        # --- Check for interrupt first (poll is non-blocking) ---
-        if enters.poll():
-            print("⚡ Enter pressed — interrupting...")
+        # --- Check for keypress (poll is non-blocking) ---
+        key = enters.poll()
+        if key == "" or key == "#":
+            is_dismiss = (key == "#")
+            label = "# pressed — dismissing..." if is_dismiss else "Enter pressed — interrupting..."
+            print(f"⚡ {label}")
             await ws.send(json.dumps({"type": "response.cancel"}))
             stop_playback.set()
             drain_queue(play_queue)
@@ -189,17 +201,15 @@ async def receive_response(
                 if stale_type in ("response.cancelled", "response.done", "error"):
                     print("✅ Cancel confirmed")
                     break
-            # Drain any remaining events (transcription completions, etc.)
-            # that arrive just after the cancel confirmation
             try:
                 while True:
                     stale = await asyncio.wait_for(ws.recv(), timeout=0.3)
                     stale_type = json.loads(stale).get("type", "")
                     if stale_type in ("error", "session.created"):
-                        break  # something unexpected — stop draining
+                        break
             except asyncio.TimeoutError:
-                pass  # no more events — buffer is clean
-            return user_text, assistant_text, True
+                pass
+            return user_text, assistant_text, not is_dismiss, is_dismiss
 
         event = json.loads(raw)
         etype = event.get("type", "")
@@ -254,7 +264,7 @@ async def receive_response(
             break
 
     play_queue.put(None)
-    return user_text, assistant_text, False
+    return user_text, assistant_text, False, False
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +284,8 @@ async def main():
     print("   Press Enter to start speaking.")
     print("   Press Enter again to stop and get a response.")
     print("   Press Enter while the model is speaking to interrupt it.")
-    print("   Type 'quit' then Enter to exit.")
+    print("   Press # to dismiss the model without recording.")
+    print("   Press Ctrl+C to exit.")
     print("=" * 50)
 
     enters = EnterQueue()
@@ -318,9 +329,9 @@ async def main():
 
             # --- Wait for Enter to start a turn ---
             if not interrupted:
-                print("> Press Enter to speak (or type 'quit'): ", end="", flush=True)
+                print("> Press Enter to speak (Ctrl+C to quit)", flush=True)
                 text = await enters.wait()
-                if text.lower() == "quit":
+                if text == "quit":
                     break
                 print("🟢 Listening...")
             else:
@@ -353,25 +364,32 @@ async def main():
             player.start()
 
             # --- Receive response (interrupt detection is inside via poll()) ---
-            print("🤖 Thinking...  (press Enter to interrupt)")
-            user_text, assistant_text, interrupted = await receive_response(
+            print("🤖 Thinking...  (press Enter to interrupt, # to dismiss)")
+            user_text, assistant_text, interrupted, dismissed = await receive_response(
                 ws, play_queue, stop_playback, enters, t_committed
             )
 
-            # --- Wait for playback, checking for interrupt every 50ms ---
-            if not interrupted:
+            # --- Wait for playback, checking for interrupt/dismiss every 50ms ---
+            if not interrupted and not dismissed:
                 while player.is_alive():
-                    if enters.poll():
+                    key = enters.poll()
+                    if key == "":
                         print("⚡ Enter pressed — stopping playback...")
                         stop_playback.set()
                         drain_queue(play_queue)
                         interrupted = True
                         break
+                    elif key == "#":
+                        print("⚡ # pressed — dismissing playback...")
+                        stop_playback.set()
+                        drain_queue(play_queue)
+                        dismissed = True
+                        break
                     await asyncio.sleep(0.05)
 
             player.join()
 
-            if not interrupted:
+            if not interrupted and not dismissed:
                 print(f"⏱  Commit → playback end:   {time.perf_counter() - t_committed:.2f}s")
 
             if assistant_text:
@@ -380,8 +398,12 @@ async def main():
             if user_text:
                 conversation_log.append({"role": "user", "text": user_text})
             if assistant_text:
-                suffix = " [interrupted]" if interrupted else ""
+                suffix = " [interrupted]" if interrupted else (" [dismissed]" if dismissed else "")
                 conversation_log.append({"role": "assistant", "text": assistant_text + suffix})
+
+            # # key returns to idle without entering recording mode
+            if dismissed:
+                interrupted = False
 
     if conversation_log:
         print("\n" + "=" * 50)
