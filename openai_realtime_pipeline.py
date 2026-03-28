@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import queue
+import sys
 import threading
 import time
 
@@ -37,12 +38,6 @@ MODEL = "gpt-realtime-1.5"
 VOICE = "alloy"     # options: alloy, echo, fable, onyx, nova, shimmer
 WS_URL = f"wss://api.openai.com/v1/realtime?model={MODEL}"
 
-def get_input(prompt=""):
-    result = input(prompt)
-    print("⌨️  Enter pressed")
-    return result
-
-
 SYSTEM_PROMPT = (
     "You are a knowledgeable and curious companion riding along in the car. "
     "Your job is to have real conversations — answer questions, explain ideas, discuss topics, "
@@ -56,7 +51,54 @@ SYSTEM_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
-# Audio playback — runs in its own thread, plays PCM16 chunks from a queue
+# EnterQueue — one stdin thread, queues every Enter press
+# ---------------------------------------------------------------------------
+
+class EnterQueue:
+    """
+    Single background thread reads stdin forever.
+    Every Enter press is put into a thread-safe queue.
+    Use wait() to block until the next press (async).
+    Use poll() for a non-blocking check (sync, safe inside asyncio).
+    """
+
+    def __init__(self):
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+
+    def start(self):
+        t = threading.Thread(target=self._reader, daemon=True)
+        t.start()
+
+    def _reader(self):
+        while True:
+            line = sys.stdin.readline().strip()
+            print("⌨️  Enter pressed")
+            self._q.put(line)
+
+    def poll(self) -> bool:
+        """Non-blocking: returns True and consumes the press if one is queued."""
+        try:
+            self._q.get_nowait()
+            return True
+        except queue.Empty:
+            return False
+
+    def drain(self):
+        """Discard all queued Enter presses."""
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+
+    async def wait(self) -> str:
+        """Async: waits until the next Enter press, returns whatever was typed."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._q.get)
+
+
+# ---------------------------------------------------------------------------
+# Audio playback — runs in its own thread
 # ---------------------------------------------------------------------------
 
 def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
@@ -65,7 +107,7 @@ def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
     try:
         while not stop_event.is_set():
             chunk = play_queue.get()
-            if chunk is None:   # sentinel — stop playing
+            if chunk is None:
                 break
             stream.write(chunk)
     finally:
@@ -75,7 +117,6 @@ def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
 
 
 def drain_queue(q: queue.Queue):
-    """Empty a queue and send the None sentinel to stop the player thread."""
     while not q.empty():
         try:
             q.get_nowait()
@@ -85,7 +126,7 @@ def drain_queue(q: queue.Queue):
 
 
 # ---------------------------------------------------------------------------
-# Mic streaming — async task, sends audio chunks over the WebSocket
+# Mic streaming — async task
 # ---------------------------------------------------------------------------
 
 async def stream_mic(ws, stop_event: asyncio.Event):
@@ -109,41 +150,54 @@ async def stream_mic(ws, stop_event: asyncio.Event):
 
 
 # ---------------------------------------------------------------------------
-# Response receiver — reads WebSocket events until response.done
+# Response receiver — polls EnterQueue for interrupts after every WS event
 # ---------------------------------------------------------------------------
 
 async def receive_response(
     ws,
     play_queue: queue.Queue,
+    stop_playback: threading.Event,
+    enters: EnterQueue,
     t_committed: float,
-    interrupt_event: asyncio.Event,
 ) -> tuple[str, str, bool]:
     """
-    Consumes WebSocket events for one response turn.
-    Handles tool calls before the final audio response.
-    Plays audio via play_queue as chunks arrive.
-
+    Reads WebSocket events until response.done (or interrupt).
+    Checks enters.poll() after every event — no separate task, no cancel races.
     Returns (user_transcript, assistant_transcript, was_interrupted).
     """
     user_text = ""
     assistant_text = ""
     t_first_audio = None
-    pending_fn_calls: dict[str, dict] = {}   # call_id → {name, arguments}
+    pending_fn_calls: dict[str, dict] = {}
+
+    # Discard any Enter presses that arrived before we started listening
+    # (e.g. the stop-recording Enter, or a late press from the previous turn)
+    enters.drain()
 
     async for raw in ws:
-        # Check for interrupt on every event
-        if interrupt_event.is_set():
+
+        # --- Check for interrupt first (poll is non-blocking) ---
+        if enters.poll():
+            print("⚡ Enter pressed — interrupting...")
             await ws.send(json.dumps({"type": "response.cancel"}))
+            stop_playback.set()
             drain_queue(play_queue)
-            # Drain stale WebSocket events until the server confirms the cancel.
-            # Without this, leftover audio.delta events from the cancelled response
-            # sit in the buffer and get picked up as the next response's audio.
             print("🧹 Draining cancelled response...")
             async for stale in ws:
                 stale_type = json.loads(stale).get("type", "")
                 if stale_type in ("response.cancelled", "response.done", "error"):
-                    print(f"✅ Cancel confirmed ({stale_type})")
+                    print("✅ Cancel confirmed")
                     break
+            # Drain any remaining events (transcription completions, etc.)
+            # that arrive just after the cancel confirmation
+            try:
+                while True:
+                    stale = await asyncio.wait_for(ws.recv(), timeout=0.3)
+                    stale_type = json.loads(stale).get("type", "")
+                    if stale_type in ("error", "session.created"):
+                        break  # something unexpected — stop draining
+            except asyncio.TimeoutError:
+                pass  # no more events — buffer is clean
             return user_text, assistant_text, True
 
         event = json.loads(raw)
@@ -203,30 +257,6 @@ async def receive_response(
 
 
 # ---------------------------------------------------------------------------
-# Recording phase — shared between normal turns and post-interrupt turns
-# ---------------------------------------------------------------------------
-
-async def do_recording(ws, loop) -> float:
-    """
-    Records mic audio and sends it to the WebSocket.
-    Returns t_record_end (perf_counter at the moment recording stops).
-    """
-    print("🎤 Recording... press Enter to stop")
-    t_record_start = time.perf_counter()
-    stop_recording = asyncio.Event()
-    mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
-
-    await loop.run_in_executor(None, get_input)
-    print("⏹  Recording stopped")
-    stop_recording.set()
-    await mic_task
-
-    t_record_end = time.perf_counter()
-    print(f"⏱  Recording duration:      {t_record_end - t_record_start:.2f}s")
-    return t_record_end
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -245,6 +275,9 @@ async def main():
     print("   Press Enter while the model is speaking to interrupt it.")
     print("   Type 'quit' then Enter to exit.")
     print("=" * 50)
+
+    enters = EnterQueue()
+    enters.start()
 
     conversation_log = []
     loop = asyncio.get_event_loop()
@@ -278,31 +311,39 @@ async def main():
         if json.loads(raw).get("type") == "session.updated":
             print("✅ Session configured — ready\n")
 
-        # Conversation loop
         interrupted = False
 
         while True:
+
+            # --- Wait for Enter to start a turn ---
             if not interrupted:
-                user_input = await loop.run_in_executor(
-                    None, get_input, "> Press Enter to speak (or type 'quit'): "
-                )
-                if user_input.strip().lower() == "quit":
+                print("> Press Enter to speak (or type 'quit'): ", end="", flush=True)
+                text = await enters.wait()
+                if text.lower() == "quit":
                     break
                 print("🟢 Listening...")
-
-            # --- Recording ---
-            if interrupted:
-                # Clear any leftover audio from the cancelled response before recording
+            else:
                 await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-                print("🎤 Go ahead — press Enter when done speaking")
-            await do_recording(ws, loop)
+                print("⚡ Interrupted — speak now, press Enter when done")
 
-            # Commit and request response
+            # --- Record ---
+            print("🎤 Recording... press Enter to stop")
+            t_record_start = time.perf_counter()
+            stop_recording = asyncio.Event()
+            mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
+
+            await enters.wait()
+            print("⏹  Recording stopped")
+            stop_recording.set()
+            await mic_task
+            print(f"⏱  Recording duration:      {time.perf_counter() - t_record_start:.2f}s")
+
+            # --- Commit and request response ---
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
             t_committed = time.perf_counter()
 
-            # Start audio player thread — stoppable via stop_playback event
+            # --- Start player ---
             play_queue: queue.Queue = queue.Queue()
             stop_playback = threading.Event()
             player = threading.Thread(
@@ -310,44 +351,37 @@ async def main():
             )
             player.start()
 
-            interrupt_event = asyncio.Event()
-
-            async def watch_for_interrupt():
-                await loop.run_in_executor(None, get_input)
-                print("⚡ Enter pressed — interrupting...")
-                interrupt_event.set()
-                stop_playback.set()
-                drain_queue(play_queue)
-
+            # --- Receive response (interrupt detection is inside via poll()) ---
             print("🤖 Thinking...  (press Enter to interrupt)")
-            interrupt_task = asyncio.create_task(watch_for_interrupt())
-            response_task = asyncio.create_task(
-                receive_response(ws, play_queue, t_committed, interrupt_event)
+            user_text, assistant_text, interrupted = await receive_response(
+                ws, play_queue, stop_playback, enters, t_committed
             )
 
-            await response_task
-            # Player may still be playing — wait for it (returns instantly if interrupted)
-            await loop.run_in_executor(None, player.join)
-            interrupt_task.cancel()
+            # --- Wait for playback, checking for interrupt every 50ms ---
+            if not interrupted:
+                while player.is_alive():
+                    if enters.poll():
+                        print("⚡ Enter pressed — stopping playback...")
+                        stop_playback.set()
+                        drain_queue(play_queue)
+                        interrupted = True
+                        break
+                    await asyncio.sleep(0.05)
 
-            user_text, assistant_text, _ = response_task.result()
-            interrupted = interrupt_event.is_set()
+            player.join()
 
             if not interrupted:
-                t_end = time.perf_counter()
-                print(f"⏱  Commit → playback end:   {t_end - t_committed:.2f}s")
+                print(f"⏱  Commit → playback end:   {time.perf_counter() - t_committed:.2f}s")
 
             if assistant_text:
                 print(f"✅ Assistant: {assistant_text}\n")
 
-            # Only save complete (non-interrupted) turns to the transcript
-            if not interrupted:
-                if user_text:
-                    conversation_log.append({"role": "user", "text": user_text})
-                if assistant_text:
-                    conversation_log.append({"role": "assistant", "text": assistant_text})
+            if user_text:
+                conversation_log.append({"role": "user", "text": user_text})
+            if assistant_text:
+                suffix = " [interrupted]" if interrupted else ""
+                conversation_log.append({"role": "assistant", "text": assistant_text + suffix})
 
-    # Transcript
     if conversation_log:
         print("\n" + "=" * 50)
         print("📝 Conversation Transcript")
