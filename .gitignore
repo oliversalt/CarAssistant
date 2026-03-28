@@ -77,3 +77,5 @@ Pipfile.lock
 .ropeproject/
 
 *.wav
+
+*.spotify_cache
