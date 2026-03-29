@@ -79,3 +79,5 @@ Pipfile.lock
 *.wav
 
 *.spotify_cache
+
+animation/
