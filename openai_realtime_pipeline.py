@@ -24,7 +24,21 @@ import threading
 import time
 from pathlib import Path
 
-import msvcrt
+if sys.platform == "win32":
+    import msvcrt
+    def _read_key() -> str:
+        return msvcrt.getwch()
+else:
+    import tty
+    import termios
+    def _read_key() -> str:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 import pyaudio
 import websockets
@@ -89,7 +103,7 @@ class EnterQueue:
 
     def _reader(self):
         while True:
-            ch = msvcrt.getwch()
+            ch = _read_key()
             if ch in ('\r', '\n'):
                 print("⌨️  Enter pressed")
                 self._q.put("")
