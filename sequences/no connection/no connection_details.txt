@@ -1,0 +1,1 @@
+show frame 1 until connection is resolved then go to idle

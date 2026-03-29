@@ -1,0 +1,1 @@
+on startup play frames 0->11 each one for 200ms then go to idle

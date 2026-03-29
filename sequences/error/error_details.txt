@@ -1,0 +1,7 @@
+play from default (0) to frame 9
+frame 1 and 2: 100 ms each
+frames 3->9: 200ms each
+
+then loop 10-14
+frame10 and 11: 100 ms each
+frames 12,13,14: 750ms each

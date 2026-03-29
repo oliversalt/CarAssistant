@@ -1,0 +1,1 @@
+play from 1 -> 14 each frame being 350ms long

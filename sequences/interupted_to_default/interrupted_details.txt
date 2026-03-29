@@ -1,0 +1,1 @@
+show frame 1 for 700ms when the interuptted button or # button is clicked

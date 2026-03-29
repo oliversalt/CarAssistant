@@ -1,0 +1,1 @@
+loop frames 1-6 each one 450ms

@@ -1,0 +1,2 @@
+loop 2-9 each frame being 100ms
+then go to speaking when done

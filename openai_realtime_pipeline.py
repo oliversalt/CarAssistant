@@ -207,6 +207,8 @@ async def receive_response(
             is_dismiss = (key == "#")
             label = "# pressed — dismissing..." if is_dismiss else "Enter pressed — interrupting..."
             print(f"⚡ {label}")
+            if is_dismiss:
+                set_state("DISMISSED")
             await ws.send(json.dumps({"type": "response.cancel"}))
             stop_playback.set()
             drain_queue(play_queue)
@@ -397,6 +399,7 @@ async def main():
                         print("⚡ # pressed — dismissing playback...")
                         stop_playback.set()
                         drain_queue(play_queue)
+                        set_state("DISMISSED")
                         dismissed = True
                         break
                     await asyncio.sleep(0.05)
@@ -447,8 +450,11 @@ if __name__ == "__main__":
         pipeline_thread.start()
 
         while pipeline_thread.is_alive():
-            img = ui.draw_frame(_ui_state)
-            ui.show_frame(img)
+            try:
+                img = ui.draw_frame(_ui_state)
+                ui.show_frame(img)
+            except Exception:
+                break
             time.sleep(1 / 30)
     else:
         _run_pipeline()
