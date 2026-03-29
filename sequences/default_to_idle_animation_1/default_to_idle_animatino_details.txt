@@ -1,0 +1,1 @@
+play from 2->9 each frame 500ms then return to idle animation

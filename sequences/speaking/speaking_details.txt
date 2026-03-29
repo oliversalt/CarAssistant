@@ -1,0 +1,1 @@
+loop frame 1 -> 19 each one for 130ms until finished speaking then go to idle

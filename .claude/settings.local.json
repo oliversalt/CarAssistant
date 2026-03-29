@@ -13,7 +13,8 @@
       "WebFetch(domain:docs.cloud.google.com)",
       "WebFetch(domain:gist.github.com)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:discuss.ai.google.dev)"
+      "WebFetch(domain:discuss.ai.google.dev)",
+      "Bash(grep \"\\\\.png$\")"
     ]
   }
 }

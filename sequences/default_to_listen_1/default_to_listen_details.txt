@@ -1,0 +1,2 @@
+loop 1->12 each one 400 ms
+as soon as listening stops go to thinking animations

@@ -1,0 +1,7 @@
+play:
+frame 1 for 350ms
+frame 2 for 350ms
+frame 3 for 350ms 
+frame 4 for 350ms 
+frame 5 until the user finishes speaking
+then go straight to thinking animation
