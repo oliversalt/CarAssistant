@@ -24,7 +24,21 @@ import threading
 import time
 from pathlib import Path
 
-import msvcrt
+if sys.platform == "win32":
+    import msvcrt
+    def _read_key() -> str:
+        return msvcrt.getwch()
+else:
+    import tty
+    import termios
+    def _read_key() -> str:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 import pyaudio
 import websockets
@@ -45,7 +59,12 @@ def set_state(s: str) -> None:
     _ui_state = s
 
 
-MIC_INDEX = 1
+if sys.platform == "win32":
+    MIC_INDEX     = 1
+    SPEAKER_INDEX = 8
+else:  # Linux (Pi)
+    MIC_INDEX     = 3
+    SPEAKER_INDEX = 3
 RATE = 24000        # Realtime API expects 24kHz PCM16
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
@@ -89,7 +108,7 @@ class EnterQueue:
 
     def _reader(self):
         while True:
-            ch = msvcrt.getwch()
+            ch = _read_key()
             if ch in ('\r', '\n'):
                 print("⌨️  Enter pressed")
                 self._q.put("")
@@ -127,7 +146,8 @@ class EnterQueue:
 
 def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True)
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True,
+                    output_device_index=SPEAKER_INDEX)
     try:
         while not stop_event.is_set():
             chunk = play_queue.get()
