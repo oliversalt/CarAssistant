@@ -28,17 +28,32 @@ if sys.platform == "win32":
     import msvcrt
     def _read_key() -> str:
         return msvcrt.getwch()
+    def _setup_terminal() -> None:
+        pass
+    def _restore_terminal() -> None:
+        pass
 else:
+    import atexit
     import tty
     import termios
-    def _read_key() -> str:
+    _original_term = None
+
+    def _setup_terminal() -> None:
+        global _original_term
         fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            return sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        _original_term = termios.tcgetattr(fd)
+        tty.setcbreak(fd)   # single-char input, no echo — keeps output processing so \n works
+        atexit.register(_restore_terminal)
+
+    def _restore_terminal() -> None:
+        if _original_term is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _original_term)
+            except Exception:
+                pass
+
+    def _read_key() -> str:
+        return sys.stdin.read(1)
 
 import pyaudio
 import websockets
@@ -64,24 +79,35 @@ if sys.platform == "win32":
     SPEAKER_INDEX = 8
 else:  # Linux (Pi)
     MIC_INDEX     = 3
-    SPEAKER_INDEX = 3
+    SPEAKER_INDEX = 4
 RATE     = 24000   # OpenAI Realtime API is fixed at 24kHz
 HW_RATE  = 48000 if sys.platform != "win32" else 24000  # AB13X on Pi only supports 48kHz
 
 
+OUT_CHANNELS = 2 if sys.platform != "win32" else 1  # AB13X playback requires stereo
+
+
 def _downsample_2x(data: bytes) -> bytes:
-    """48000 → 24000 Hz: drop every other mono PCM16 sample."""
+    """48000 Hz mono → 24000 Hz mono: keep every other PCM16 sample."""
     out = bytearray()
-    for i in range(0, len(data), 4):   # step 4 bytes = 2 samples
-        out += data[i:i + 2]           # keep first sample, skip second
+    for i in range(0, len(data), 4):   # 4 bytes = 2 samples; keep first, skip second
+        out += data[i:i + 2]
     return bytes(out)
 
 
-def _upsample_2x(data: bytes) -> bytes:
-    """24000 → 48000 Hz: duplicate every mono PCM16 sample."""
+def _process_output(data: bytes) -> bytes:
+    """24000 Hz mono → 48000 Hz stereo: upsample + duplicate channel."""
+    if HW_RATE == RATE and OUT_CHANNELS == 1:
+        return data
     out = bytearray()
     for i in range(0, len(data), 2):
-        out += data[i:i + 2] * 2
+        s = data[i:i + 2]
+        if HW_RATE != RATE and OUT_CHANNELS == 2:
+            out += s + s + s + s   # upsample x2 + stereo: 4 copies per sample
+        elif HW_RATE != RATE:
+            out += s + s           # upsample only
+        else:
+            out += s + s           # stereo only
     return bytes(out)
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
@@ -120,6 +146,7 @@ class EnterQueue:
         self._q: queue.SimpleQueue = queue.SimpleQueue()
 
     def start(self):
+        _setup_terminal()
         t = threading.Thread(target=self._reader, daemon=True)
         t.start()
 
@@ -163,16 +190,14 @@ class EnterQueue:
 
 def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=HW_RATE, output=True,
+    stream = p.open(format=FORMAT, channels=OUT_CHANNELS, rate=HW_RATE, output=True,
                     output_device_index=SPEAKER_INDEX)
     try:
         while not stop_event.is_set():
             chunk = play_queue.get()
             if chunk is None:
                 break
-            if HW_RATE != RATE:
-                chunk = _upsample_2x(chunk)
-            stream.write(chunk)
+            stream.write(_process_output(chunk))
     finally:
         stream.stop_stream()
         stream.close()
