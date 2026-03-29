@@ -65,7 +65,24 @@ if sys.platform == "win32":
 else:  # Linux (Pi)
     MIC_INDEX     = 3
     SPEAKER_INDEX = 3
-RATE = 48000 if sys.platform != "win32" else 24000
+RATE     = 24000   # OpenAI Realtime API is fixed at 24kHz
+HW_RATE  = 48000 if sys.platform != "win32" else 24000  # AB13X on Pi only supports 48kHz
+
+
+def _downsample_2x(data: bytes) -> bytes:
+    """48000 → 24000 Hz: drop every other mono PCM16 sample."""
+    out = bytearray()
+    for i in range(0, len(data), 4):   # step 4 bytes = 2 samples
+        out += data[i:i + 2]           # keep first sample, skip second
+    return bytes(out)
+
+
+def _upsample_2x(data: bytes) -> bytes:
+    """24000 → 48000 Hz: duplicate every mono PCM16 sample."""
+    out = bytearray()
+    for i in range(0, len(data), 2):
+        out += data[i:i + 2] * 2
+    return bytes(out)
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK = 1024
@@ -146,13 +163,15 @@ class EnterQueue:
 
 def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True,
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=HW_RATE, output=True,
                     output_device_index=SPEAKER_INDEX)
     try:
         while not stop_event.is_set():
             chunk = play_queue.get()
             if chunk is None:
                 break
+            if HW_RATE != RATE:
+                chunk = _upsample_2x(chunk)
             stream.write(chunk)
     finally:
         stream.stop_stream()
@@ -176,12 +195,14 @@ def drain_queue(q: queue.Queue):
 async def stream_mic(ws, stop_event: asyncio.Event):
     loop = asyncio.get_event_loop()
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+    stream = p.open(format=FORMAT, channels=CHANNELS, rate=HW_RATE,
                     input=True, input_device_index=MIC_INDEX,
                     frames_per_buffer=CHUNK)
     try:
         while not stop_event.is_set():
             data = await loop.run_in_executor(None, stream.read, CHUNK)
+            if HW_RATE != RATE:
+                data = _downsample_2x(data)
             b64 = base64.b64encode(data).decode()
             await ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
@@ -347,8 +368,6 @@ async def main():
                 "voice": VOICE,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "input_audio_sample_rate": RATE,
-                "output_audio_sample_rate": RATE,
                 "input_audio_transcription": {"model": "whisper-1"},
                 "turn_detection": None,
                 "tools": TOOLS,
