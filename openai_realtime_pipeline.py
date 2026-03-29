@@ -65,7 +65,7 @@ if sys.platform == "win32":
 else:  # Linux (Pi)
     MIC_INDEX     = 3
     SPEAKER_INDEX = 3
-RATE = 24000        # Realtime API expects 24kHz PCM16
+RATE = 48000 if sys.platform != "win32" else 24000
 CHANNELS = 1
 FORMAT = pyaudio.paInt16
 CHUNK = 1024
@@ -347,6 +347,8 @@ async def main():
                 "voice": VOICE,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
+                "input_audio_sample_rate": RATE,
+                "output_audio_sample_rate": RATE,
                 "input_audio_transcription": {"model": "whisper-1"},
                 "turn_detection": None,
                 "tools": TOOLS,
