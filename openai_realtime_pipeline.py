@@ -9,14 +9,20 @@ Prints a full conversation transcript when you quit.
 
 Usage:
     python realtime_pipeline.py
+with ui:
+    python .\openai_realtime_pipeline.py --screen
 """
 
+import argparse
 import asyncio
 import base64
 import json
 import os
 import queue
+import sys
 import threading
+import time
+from pathlib import Path
 
 import msvcrt
 
@@ -27,6 +33,17 @@ from dotenv import load_dotenv
 from tools import TOOLS, dispatch
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# UI state — updated by the pipeline, read by the screen loop
+# ---------------------------------------------------------------------------
+
+_ui_state: str = "READY"
+
+def set_state(s: str) -> None:
+    global _ui_state
+    _ui_state = s
+
 
 MIC_INDEX = 1
 RATE = 24000        # Realtime API expects 24kHz PCM16
@@ -176,6 +193,7 @@ async def receive_response(
     user_text = ""
     assistant_text = ""
     pending_fn_calls: dict[str, dict] = {}
+    _speaking_set = False
 
     # Discard any Enter presses that arrived before we started listening
     # (e.g. the stop-recording Enter, or a late press from the previous turn)
@@ -212,6 +230,9 @@ async def receive_response(
         etype = event.get("type", "")
 
         if etype == "response.audio.delta":
+            if not _speaking_set:
+                set_state("SPEAKING")
+                _speaking_set = True
             play_queue.put(base64.b64decode(event["delta"]))
 
         elif etype == "response.audio_transcript.delta":
@@ -245,6 +266,8 @@ async def receive_response(
                         }
                     }))
                 pending_fn_calls.clear()
+                _speaking_set = False
+                set_state("THINKING")
                 await ws.send(json.dumps({"type": "response.create"}))
             else:
                 break
@@ -312,6 +335,7 @@ async def main():
         raw = await ws.recv()
         if json.loads(raw).get("type") == "session.updated":
             print("✅ Session configured — ready\n")
+            set_state("READY")
 
         interrupted = False
 
@@ -319,6 +343,7 @@ async def main():
 
             # --- Wait for Enter to start a turn ---
             if not interrupted:
+                set_state("READY")
                 print("> Press Enter to speak (Ctrl+C to quit)", flush=True)
                 text = await enters.wait()
                 if text == "quit":
@@ -329,6 +354,7 @@ async def main():
                 print("⚡ Interrupted — speak now, press Enter when done")
 
             # --- Record ---
+            set_state("LISTENING")
             print("🎤 Recording... press Enter to stop")
             stop_recording = asyncio.Event()
             mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
@@ -339,6 +365,7 @@ async def main():
             await mic_task
 
             # --- Commit and request response ---
+            set_state("THINKING")
             await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
             await ws.send(json.dumps({"type": "response.create"}))
 
@@ -401,5 +428,27 @@ async def main():
         print("\n(No conversation recorded)")
 
 
-if __name__ == "__main__":
+def _run_pipeline():
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CarPi Realtime Pipeline")
+    parser.add_argument("--screen", action="store_true",
+                        help="Show the CarPi UI on screen alongside the terminal")
+    args = parser.parse_args()
+
+    if args.screen:
+        # tkinter must live on the main thread — run asyncio pipeline in a thread
+        sys.path.insert(0, str(Path(__file__).parent / "screen-ui"))
+        import carpi_ui_v2 as ui
+
+        pipeline_thread = threading.Thread(target=_run_pipeline, daemon=True)
+        pipeline_thread.start()
+
+        while pipeline_thread.is_alive():
+            img = ui.draw_frame(_ui_state)
+            ui.show_frame(img)
+            time.sleep(1 / 30)
+    else:
+        _run_pipeline()
