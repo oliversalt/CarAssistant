@@ -68,10 +68,16 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 _ui_state: str = "READY"
+_ui_error_message: str = ""
 
 def set_state(s: str) -> None:
     global _ui_state
     _ui_state = s
+
+def set_error(msg: str) -> None:
+    global _ui_error_message
+    _ui_error_message = msg
+    set_state("ERROR")
 
 
 if sys.platform == "win32":
@@ -365,6 +371,11 @@ async def receive_response(
 
 async def main():
     api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("❌ ERROR: OPENAI_API_KEY not set in .env file")
+        set_error("OPENAI_API_KEY not set in .env file")
+        return
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "OpenAI-Beta": "realtime=v1",
@@ -386,115 +397,170 @@ async def main():
     conversation_log = []
     loop = asyncio.get_event_loop()
 
-    async with websockets.connect(WS_URL, additional_headers=headers) as ws:
+    try:
+        async with websockets.connect(WS_URL, additional_headers=headers) as ws:
 
-        # Handshake
-        raw = await ws.recv()
-        event = json.loads(raw)
-        if event.get("type") != "session.created":
-            print(f"⚠️  Unexpected first event: {event.get('type')}")
-            return
-        print("✅ Session created")
-
-        await ws.send(json.dumps({
-            "type": "session.update",
-            "session": {
-                "modalities": ["text", "audio"],
-                "instructions": SYSTEM_PROMPT,
-                "voice": VOICE,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
-                "turn_detection": None,
-                "tools": TOOLS,
-                "tool_choice": "auto",
-            }
-        }))
-
-        raw = await ws.recv()
-        if json.loads(raw).get("type") == "session.updated":
-            print("✅ Session configured — ready\n")
-            set_state("READY")
-
-        interrupted = False
-
-        while True:
-
-            # --- Wait for Enter to start a turn ---
-            if not interrupted:
-                set_state("READY")
-                print("> Press Enter to speak (Ctrl+C to quit)", flush=True)
-                text = await enters.wait()
-                if text == "quit":
-                    break
-                print("🟢 Listening...")
-            else:
-                await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
-                print("⚡ Interrupted — speak now, press Enter when done")
-
-            # --- Record ---
-            set_state("LISTENING")
-            print("🎤 Recording... press Enter to stop")
-            stop_recording = asyncio.Event()
-            mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
-
-            await enters.wait()
-            print("⏹  Recording stopped")
-            stop_recording.set()
-            await mic_task
-
-            # --- Commit and request response ---
-            set_state("THINKING")
-            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-            await ws.send(json.dumps({"type": "response.create"}))
-
-            # --- Start player ---
-            play_queue: queue.Queue = queue.Queue()
-            stop_playback = threading.Event()
-            player = threading.Thread(
-                target=audio_player, args=(play_queue, stop_playback), daemon=True
-            )
-            player.start()
-
-            # --- Receive response (interrupt detection is inside via poll()) ---
-            print("🤖 Thinking...  (press Enter to interrupt, # to dismiss)")
-            user_text, assistant_text, interrupted, dismissed = await receive_response(
-                ws, play_queue, stop_playback, enters
-            )
-
-            # --- Wait for playback, checking for interrupt/dismiss every 50ms ---
-            if not interrupted and not dismissed:
-                while player.is_alive():
+            # Handshake
+            raw = await ws.recv()
+            event = json.loads(raw)
+            if event.get("type") == "error":
+                error_msg = event.get("error", {}).get("message", str(event))
+                print(f"❌ API error: {error_msg}")
+                set_error(error_msg)
+                print("Press Ctrl+C to exit")
+                while True:
                     key = enters.poll()
-                    if key == "":
-                        print("⚡ Enter pressed — stopping playback...")
-                        stop_playback.set()
-                        drain_queue(play_queue)
-                        interrupted = True
+                    if key == "quit":
+                        return
+                    await asyncio.sleep(0.1)
+            if event.get("type") != "session.created":
+                print(f"⚠️  Unexpected first event: {event.get('type')}")
+                set_error(f"Unexpected response: {event.get('type')}")
+                print("Press Ctrl+C to exit")
+                while True:
+                    key = enters.poll()
+                    if key == "quit":
+                        return
+                    await asyncio.sleep(0.1)
+            print("✅ Session created")
+
+            await ws.send(json.dumps({
+                "type": "session.update",
+                "session": {
+                    "modalities": ["text", "audio"],
+                    "instructions": SYSTEM_PROMPT,
+                    "voice": VOICE,
+                    "input_audio_format": "pcm16",
+                    "output_audio_format": "pcm16",
+                    "input_audio_transcription": {"model": "whisper-1"},
+                    "turn_detection": None,
+                    "tools": TOOLS,
+                    "tool_choice": "auto",
+                }
+            }))
+
+            raw = await ws.recv()
+            if json.loads(raw).get("type") == "session.updated":
+                print("✅ Session configured — ready\n")
+                set_state("READY")
+
+            interrupted = False
+
+            while True:
+
+                # --- Wait for Enter to start a turn ---
+                if not interrupted:
+                    set_state("READY")
+                    print("> Press Enter to speak (Ctrl+C to quit)", flush=True)
+                    text = await enters.wait()
+                    if text == "quit":
                         break
-                    elif key == "#":
-                        print("⚡ # pressed — dismissing playback...")
-                        stop_playback.set()
-                        drain_queue(play_queue)
-                        set_state("DISMISSED")
-                        dismissed = True
-                        break
-                    await asyncio.sleep(0.05)
+                    print("🟢 Listening...")
+                else:
+                    await ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                    print("⚡ Interrupted — speak now, press Enter when done")
 
-            player.join()
+                # --- Record ---
+                set_state("LISTENING")
+                print("🎤 Recording... press Enter to stop")
+                stop_recording = asyncio.Event()
+                mic_task = asyncio.create_task(stream_mic(ws, stop_recording))
 
-            if assistant_text:
-                print(f"\n✅ Assistant: {assistant_text}\n")
+                await enters.wait()
+                print("⏹  Recording stopped")
+                stop_recording.set()
+                await mic_task
 
-            if user_text:
-                conversation_log.append({"role": "user", "text": user_text})
-            if assistant_text:
-                suffix = " [interrupted]" if interrupted else (" [dismissed]" if dismissed else "")
-                conversation_log.append({"role": "assistant", "text": assistant_text + suffix})
+                # --- Commit and request response ---
+                set_state("THINKING")
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                await ws.send(json.dumps({"type": "response.create"}))
 
-            # # key returns to idle without entering recording mode
-            if dismissed:
-                interrupted = False
+                # --- Start player ---
+                play_queue: queue.Queue = queue.Queue()
+                stop_playback = threading.Event()
+                player = threading.Thread(
+                    target=audio_player, args=(play_queue, stop_playback), daemon=True
+                )
+                player.start()
+
+                # --- Receive response (interrupt detection is inside via poll()) ---
+                print("🤖 Thinking...  (press Enter to interrupt, # to dismiss)")
+                user_text, assistant_text, interrupted, dismissed = await receive_response(
+                    ws, play_queue, stop_playback, enters
+                )
+
+                # --- Wait for playback, checking for interrupt/dismiss every 50ms ---
+                if not interrupted and not dismissed:
+                    while player.is_alive():
+                        key = enters.poll()
+                        if key == "":
+                            print("⚡ Enter pressed — stopping playback...")
+                            stop_playback.set()
+                            drain_queue(play_queue)
+                            interrupted = True
+                            break
+                        elif key == "#":
+                            print("⚡ # pressed — dismissing playback...")
+                            stop_playback.set()
+                            drain_queue(play_queue)
+                            set_state("DISMISSED")
+                            dismissed = True
+                            break
+                        await asyncio.sleep(0.05)
+
+                player.join()
+
+                if assistant_text:
+                    print(f"\n✅ Assistant: {assistant_text}\n")
+
+                if user_text:
+                    conversation_log.append({"role": "user", "text": user_text})
+                if assistant_text:
+                    suffix = " [interrupted]" if interrupted else (" [dismissed]" if dismissed else "")
+                    conversation_log.append({"role": "assistant", "text": assistant_text + suffix})
+
+                # # key returns to idle without entering recording mode
+                if dismissed:
+                    interrupted = False
+
+    except websockets.exceptions.ConnectionClosedOK as e:
+        msg = str(e)
+        print(f"\n❌ Connection closed by server: {msg}")
+        if "account is not active" in msg.lower() or "billing" in msg.lower():
+            set_error("Billing issue: Check https://platform.openai.com/account/billing/overview")
+        elif "invalid" in msg.lower() or "unauthorized" in msg.lower():
+            set_error("Invalid API key: Check OPENAI_API_KEY in .env file")
+        else:
+            set_error(msg)
+        print("Press Ctrl+C to exit")
+        while True:
+            key = enters.poll()
+            if key == "quit":
+                return
+            await asyncio.sleep(0.1)
+
+    except websockets.exceptions.WebSocketException as e:
+        msg = str(e)
+        print(f"\n❌ WebSocket error: {msg}")
+        set_error(msg)
+        print("Press Ctrl+C to exit")
+        while True:
+            key = enters.poll()
+            if key == "quit":
+                return
+            await asyncio.sleep(0.1)
+
+    except Exception as e:
+        msg = str(e)
+        print(f"\n❌ Error: {msg}")
+        set_error(msg)
+        print("Press Ctrl+C to exit")
+        while True:
+            key = enters.poll()
+            if key == "quit":
+                return
+            await asyncio.sleep(0.1)
 
     if conversation_log:
         print("\n" + "=" * 50)
@@ -528,7 +594,7 @@ if __name__ == "__main__":
 
         while pipeline_thread.is_alive():
             try:
-                img = ui.draw_frame(_ui_state)
+                img = ui.draw_frame(_ui_state, _ui_error_message)
                 ui.show_frame(img)
             except Exception:
                 break

@@ -246,6 +246,12 @@ def _switch(name: str) -> None:
 def _tick_anim(pipeline_state: str) -> None:
     global _prev_pipeline_state, _listen_variant, _fidget_due_at
 
+    # ── Allow ERROR to interrupt waking_up ────────────────────────────────────
+    if pipeline_state == "ERROR" and pipeline_state != _prev_pipeline_state:
+        _prev_pipeline_state = pipeline_state
+        _switch("error_intro")
+        return
+
     # ── Waking up plays fully through before any pipeline state is processed ──
     if _anim_state == "waking_up":
         _prev_pipeline_state = pipeline_state  # stay in sync but don't act
@@ -394,10 +400,11 @@ def _draw_badge(draw: ImageDraw.Draw, label: str) -> None:
     draw.text((bx + pad_x, by + pad_y), label, font=FONTS["badge"], fill=text_col)
 
 
-def draw_frame(pipeline_state: str) -> Image.Image:
+def draw_frame(pipeline_state: str, error_message: str = "") -> Image.Image:
     """
     Advance animation state machine and return a composited frame.
-    Call once per display tick, passing the current pipeline state string.
+    Call once per display tick, passing the current pipeline state string
+    and optional error message (displayed below character when state is ERROR).
     """
     _tick_anim(pipeline_state)
 
@@ -413,6 +420,13 @@ def draw_frame(pipeline_state: str) -> Image.Image:
     badge_label = _BADGE_MAP.get(pipeline_state, pipeline_state)
     if badge_label in BADGE_COLOURS:
         _draw_badge(draw, badge_label)
+
+    # Display error message below character if state is ERROR
+    if pipeline_state == "ERROR" and error_message:
+        # Truncate to fit on screen
+        truncated = error_message if len(error_message) <= 70 else error_message[:67] + "..."
+        text_y = SCREEN_H - 60
+        draw.text((30, text_y), truncated, font=FONTS["date"], fill=(200, 30, 30))
 
     return img
 
