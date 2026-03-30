@@ -190,8 +190,13 @@ class EnterQueue:
 
 def audio_player(play_queue: queue.Queue, stop_event: threading.Event):
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT, channels=OUT_CHANNELS, rate=HW_RATE, output=True,
-                    output_device_index=SPEAKER_INDEX)
+    if sys.platform == "win32":
+        # Windows: use OS default speaker (user can change in sound settings)
+        stream = p.open(format=FORMAT, channels=OUT_CHANNELS, rate=HW_RATE, output=True)
+    else:
+        # Linux/Pi: explicitly specify the device
+        stream = p.open(format=FORMAT, channels=OUT_CHANNELS, rate=HW_RATE, output=True,
+                        output_device_index=SPEAKER_INDEX)
     try:
         while not stop_event.is_set():
             chunk = play_queue.get()
@@ -220,9 +225,15 @@ def drain_queue(q: queue.Queue):
 async def stream_mic(ws, stop_event: asyncio.Event):
     loop = asyncio.get_event_loop()
     p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT, channels=CHANNELS, rate=HW_RATE,
-                    input=True, input_device_index=MIC_INDEX,
-                    frames_per_buffer=CHUNK)
+    if sys.platform == "win32":
+        # Windows: use OS default mic (user can change in sound settings)
+        stream = p.open(format=FORMAT, channels=CHANNELS, rate=HW_RATE,
+                        input=True, frames_per_buffer=CHUNK)
+    else:
+        # Linux/Pi: explicitly specify the device
+        stream = p.open(format=FORMAT, channels=CHANNELS, rate=HW_RATE,
+                        input=True, input_device_index=MIC_INDEX,
+                        frames_per_buffer=CHUNK)
     try:
         while not stop_event.is_set():
             data = await loop.run_in_executor(None, stream.read, CHUNK)
